@@ -1,7 +1,6 @@
 services:
   frontend:
-    build: 
-      context: ./services/frontend 
+    image: atlas201/notes-frontend:v1.0.1
     ports: 
       - "${FRONTEND_PORT}:8080"
     networks:
@@ -16,8 +15,7 @@ services:
           memory: 256M
 
   api:
-    build: 
-      context: ./services/api
+    image: atlas201/notes-api:v1.0.0
     environment:
       PORT: ${API_PORT}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -43,8 +41,7 @@ services:
           memory: 256M 
        
   worker:
-    build: 
-      context: ./services/worker
+    image: atlas201/notes-worker:v1.0.0
     environment:
       PORT: ${WORKER_PORT}
       REDIS_HOST: ${REDIS_HOST}
@@ -68,7 +65,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ../services/database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     networks:
       - postgres-network
     healthcheck:

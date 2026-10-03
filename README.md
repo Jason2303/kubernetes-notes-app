@@ -1,243 +1,391 @@
-# Notes App — Dockerized Microservices
+# Notes App on Kubernetes: Resilient Deployment
 
-A simple notes application made of 5 containerized services. The app itself is deliberately minimal; the focus of this project is the container infrastructure: multi-stage builds, non-root images, network isolation, healthchecks, a registry-based production deployment, and vulnerability scanning.
+A notes application made of five containerised services, deployed to a single-node minikube cluster in the `notes-app` namespace.
 
-## Services
+- **frontend** serves the static web app through Nginx and proxies `/api` requests to the API.
+- **api** reads and writes notes in Postgres and publishes an event to Redis on every change.
+- **worker** subscribes to that Redis channel and keeps a running event count in Redis.
+- **postgres** stores the notes on a persistent volume.
+- **redis** acts as the cache and as the publish/subscribe broker between the API and the worker.
 
-| Service | Tech | Port | Responsibility |
-|---|---|---|---|
-| frontend | Vite + nginx-unprivileged | 8080 | Serves the static HTML/CSS/JS to the browser and reverse-proxies `/api` requests to the api service |
-| api | Node.js + Express | 3000 | Creates, reads and deletes notes in Postgres; caches the notes list in Redis; publishes a `notes:created` event on every new note |
-| worker | Node.js (built-in `http`) | 3001 | Subscribes to the `notes:created` channel and counts events in Redis; exposes the count on `/stats` |
-| postgres | postgres:16-alpine3.24 | 5432 | Persistent database storing all notes |
-| redis | redis:8-alpine3.22 | 6379 | Cache for the notes list (60s TTL) and pub/sub message broker between the api and the worker |
+The deployment demonstrates zero-downtime rolling updates, CPU-based auto-scaling, self-healing, persistent storage, and tier-by-tier network policies.
+
+> Docker build, image scanning and CI documentation: [docs/README.md](docs/README.md)
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    browser([Browser])
-    frontend[frontend<br/>nginx :8080]
-    api[api<br/>:3000]
-    worker[worker<br/>:3001]
-    postgres[(postgres)]
-    redis[(redis)]
+### Diagram
 
-    browser -->|":8080 (only published port)"| frontend
-    frontend -->|"/api proxy · frontend-network"| api
-    api -->|"read/write notes · postgres-network"| postgres
-    api -->|"cache + publish · redis-network"| redis
-    worker -->|"subscribe + INCR · redis-network"| redis
+```text
+                     Browser
+                        |
+                 minikube tunnel
+                        |
+       Ingress controller (ingress-nginx)
+             |                     |
+             /                   /api
+             |                     |
++------------|---------------------|---------------------+
+|            v                     v                     |
+|    frontend Svc :8080      api Svc :3000               |
+|            |                     |                     |
+|            v                     v                     |
+|       frontend x2 ----------> api x2-4  (HPA, PDB)     |
+|         (Nginx)   proxy /api  |      |                 |
+|                               |      |                 |
+|                               v      v                 |
+|   worker x1 -----------> redis :6379 postgres :5432    |
+|                               |            |           |
+|                               v            v           |
+|                           redis x1     postgres-0      |
+|                       (no persistence) (StatefulSet)   |
+|                                            |           |
+|                                            v           |
+|                                      PVC data 1Gi      |
+|                                                        |
++---------------- namespace: notes-app ------------------+
 ```
 
-**Read path:** Browser → Nginx (8080) → `/api` is proxied to the api → the api checks Redis. On a cache hit it responds immediately; on a miss it queries Postgres, stores the result in Redis, then responds.
+Arrows point from the client to the server, which is the same direction the NetworkPolicies filter on.
 
-**Create path:** The api writes the note to Postgres, deletes the cached list (so the next read is fresh), and publishes a `notes:created` event to Redis. The worker, subscribed to that channel, increments the counter `stats:notes_created` in Redis.
+### Components
 
-## Network Isolation
+| Component        | Kind        | Replicas  | Image:tag                        | Port | Notes                                                                          |
+| ---------------- | ----------- | --------- | -------------------------------- | ---- | ------------------------------------------------------------------------------ |
+| frontend         | Deployment  | 2         | `atlas201/notes-frontend:v1.0.1` | 8080 | Nginx, serves static files, proxies `/api` to the api Service. Runs as UID 101 |
+| api              | Deployment  | 2-4 (HPA) | `atlas201/notes-api:v1.0.0`      | 3000 | Init container waits for Postgres. Runs as UID 1001                            |
+| worker           | Deployment  | 1         | `atlas201/notes-worker:v1.0.0`   | 3001 | Subscribes to Redis. No Service, nothing calls it. Runs as UID 1001            |
+| postgres         | StatefulSet | 1         | `postgres:16-alpine3.24`         | 5432 | 1Gi PVC, schema loaded from the `init-sql` ConfigMap                           |
+| redis            | Deployment  | 1         | `redis:8-alpine3.22`             | 6379 | Cache and pub/sub broker, no persistence                                       |
+| note-app-ingress | Ingress     | N/A       | ingress-nginx                    | 80   | `/` to frontend, `/api` to api                                                 |
+| app-config       | ConfigMap   | N/A       | N/A                              | N/A  | Postgres and Redis host and port                                               |
+| init-sql         | ConfigMap   | N/A       | N/A                              | N/A  | `init.sql` that creates the `notes` table                                      |
+| app-secret       | Secret      | N/A       | N/A                              | N/A  | Postgres user, password and database name                                      |
 
-| Network | Members | Internal | Purpose |
-|---|---|---|---|
-| frontend-network | frontend, api | No | Nginx → api traffic. Must be non-internal because port 8080 is published to the host |
-| postgres-network | api, postgres | Yes | Only the api needs the database |
-| redis-network | api, worker, redis | Yes | Cache access and pub/sub between the api and the worker |
-| dev-network (override only) | worker | No | Dev mode only: internal networks ignore published ports, so this network lets the worker's port 3001 and debug port be reached from the host |
+### Traffic flow
 
-The api is the only service on more than one network because it is the only service that needs to talk to the frontend, Postgres and Redis. Postgres and Redis sit on `internal: true` networks: containers on them have no route to or from the outside world, and published ports don't work on them. Even if a port mapping were added by mistake, the databases stay unreachable from the host.
+The browser reaches the ingress-nginx controller through `minikube tunnel`. The Ingress sends `/api` requests to the `api` ClusterIP Service on port 3000, which returns JSON, and sends everything else to the `frontend` ClusterIP Service on port 8080, which returns the web app. The frontend's Nginx also proxies `/api` calls to the API by its Service name. Only the frontend and the API are reachable from outside the cluster, and only through the Ingress. Postgres, Redis and the worker are internal.
 
-## Prerequisites
+## Repository Structure
 
-- Docker Engine with Compose v2 (Docker Desktop on Windows/macOS includes both)
-- Git
-- Trivy (optional, for the vulnerability scans)
+```text
+notes-app/
+├── .github/workflows/
+│   └── docker-publish.yml              # CI: build, scan, push images to Docker Hub
+├── docker/                             # Docker Compose (local dev and prod)
+│   ├── docker-compose.yml
+│   ├── docker-compose.override.yml
+│   ├── docker-compose.prod.yml
+│   └── .env.example
+├── docs/
+│   └── README.md                       # Docker project documentation
+├── images-docker/                      # Docker project evidence (Trivy, CI)
+├── images-k8s/                         # Kubernetes resilience test evidence
+├── k8s/
+│   ├── namespace/
+│   │   └── namespace.yaml              # notes-app namespace
+│   ├── config/
+│   │   ├── configmap.yaml              # App settings (hosts and ports)
+│   │   ├── init-sql-configmap.yaml     # DB schema for Postgres init
+│   │   └── secret.example.yaml         # Credential template (real secret.yaml is gitignored)
+│   ├── data/
+│   │   ├── statefulset.yaml            # Postgres + PVC
+│   │   ├── postgres-headless-service.yaml  # StatefulSet DNS
+│   │   ├── postgres-clusterip-service.yaml # Client access to Postgres
+│   │   ├── deployment-redis.yaml       # Redis
+│   │   └── redis-service.yaml          # Client access to Redis
+│   ├── app/
+│   │   ├── deployment-api.yaml         # API (init container, anti-affinity)
+│   │   ├── api-service.yaml
+│   │   ├── deployment-worker.yaml      # Background worker
+│   │   ├── deployment-frontend.yaml    # Frontend (Nginx)
+│   │   └── frontend-service.yaml
+│   ├── ingress/
+│   │   └── ingress.yaml                # / to frontend, /api to api
+│   ├── scaling/
+│   │   └── hpa.yaml                    # API autoscaler, CPU 50%, 2-4 replicas
+│   ├── pdb/
+│   │   └── pdb.yaml                    # API minAvailable 1
+│   └── security/
+│       ├── networkpolicy-frontend-ingress.yaml
+│       ├── networkpolicy-api-ingress.yaml
+│       ├── networkpolicy-postgres-ingress.yaml
+│       ├── networkpolicy-redis-ingress.yaml
+│       └── networkpolicy-dns-egress.yaml
+├── services/
+│   ├── api/                            # Node.js API
+│   ├── worker/                         # Node.js worker
+│   ├── frontend/                       # Vite + Nginx
+│   └── database/init.sql               # Schema (used by Compose)
+├── .gitignore
+└── README.md                           # Kubernetes project documentation
+```
 
-## Quick Start
+## Requirements Compliance
+
+| Requirement                                      | How it's met                                                                                                                              | File                                                                                                |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Frontend, 2+ replicas, Deployment                | `replicas: 2`                                                                                                                             | `k8s/app/deployment-frontend.yaml`                                                                  |
+| Backend API, 2+ replicas, Deployment             | The Deployment has no `replicas` field. The HPA owns the replica count with `minReplicas: 2`                                              | `k8s/app/deployment-api.yaml`, `k8s/scaling/hpa.yaml`                                               |
+| Database, StatefulSet with PVC                   | Postgres StatefulSet with a 1Gi `volumeClaimTemplate`, giving a stable Pod name (`postgres-0`) and stable storage                         | `k8s/data/statefulset.yaml`                                                                         |
+| Cache layer                                      | Redis Deployment and ClusterIP Service                                                                                                    | `k8s/data/deployment-redis.yaml`                                                                    |
+| Rolling update, `maxSurge=1`, `maxUnavailable=0` | Set in the `strategy` block of each application Deployment, so a new Pod must be ready before an old one is removed                       | `k8s/app/deployment-api.yaml`, `k8s/app/deployment-worker.yaml`, `k8s/app/deployment-frontend.yaml` |
+| Liveness and readiness probes                    | Set on every container, with tuned `timeoutSeconds`, `initialDelaySeconds`, `periodSeconds` and `failureThreshold` (see Design Decisions) | All files in `k8s/app/`, `k8s/data/deployment-redis.yaml`, `k8s/data/statefulset.yaml`              |
+| Resource requests and limits                     | Set on every container, including the init container                                                                                      | All files in `k8s/app/`, `k8s/data/deployment-redis.yaml`, `k8s/data/statefulset.yaml`              |
+| PodDisruptionBudget                              | `minAvailable: 1` on the API, so voluntary disruptions such as a node drain cannot take every API Pod down at once                        | `k8s/pdb/pdb.yaml`                                                                                  |
+| HPA on the API (CPU)                             | `autoscaling/v2`, min 2, max 4, target 50% average CPU                                                                                    | `k8s/scaling/hpa.yaml`                                                                              |
+| All configuration in ConfigMaps                  | Postgres and Redis hosts and ports in `app-config`, DB schema in `init-sql`                                                               | `k8s/config/configmap.yaml`, `k8s/config/init-sql-configmap.yaml`                                   |
+| All secrets in Secrets                           | Postgres user, password and database name in `app-secret`. The real file is gitignored and a template is committed                        | `k8s/config/secret.example.yaml`                                                                    |
+| NetworkPolicy between tiers                      | One ingress policy per tier plus a DNS egress policy                                                                                      | All files in `k8s/security/`                                                                        |
+| Non-root containers where possible               | `runAsNonRoot: true` with `runAsUser` 1001 (api, worker) and 101 (frontend)                                                               | All files in `k8s/app/`                                                                             |
+| Namespace isolation                              | Every resource lives in `notes-app`                                                                                                       | `k8s/namespace/namespace.yaml`                                                                      |
+| ClusterIP Services                               | One per component that is called by another, plus a headless Service for the StatefulSet                                                  | `k8s/app/*-service.yaml`, `k8s/data/*-service.yaml`                                                 |
+| Ingress with path routing                        | `/` to frontend:8080, `/api` to api:3000, `pathType: Prefix`, no rewrite                                                                  | `k8s/ingress/ingress.yaml`                                                                          |
+
+## Deployment Instructions
+
+### Prerequisites
+
+- Docker
+- minikube (tested with Kubernetes v1.35.1, Docker driver)
+- kubectl
+- At least 3 GB RAM and 2 CPUs free for the minikube node
+
+### Steps
+
+1. Start the cluster and enable the addons:
+
+   ```bash
+   minikube start --driver=docker --memory=3072 --cpus=2
+   minikube addons enable ingress
+   minikube addons enable metrics-server
+   ```
+
+2. Clone the repo:
+
+   ```bash
+   git clone https://github.com/Jason2303/notes-app.git
+   cd notes-app
+   ```
+
+3. Create the Secret file from the template and set a password:
+
+   ```bash
+   cp k8s/config/secret.example.yaml k8s/config/secret.yaml
+   nano k8s/config/secret.yaml    # replace the placeholder POSTGRES_PASSWORD
+   ```
+
+4. Apply the manifests in dependency order. The namespace must exist first, and config must exist before the Pods that read it:
+
+   ```bash
+   kubectl apply -f k8s/namespace/
+   kubectl apply -f k8s/config/configmap.yaml -f k8s/config/init-sql-configmap.yaml -f k8s/config/secret.yaml
+   kubectl apply -f k8s/data/
+   kubectl apply -f k8s/app/
+   kubectl apply -f k8s/ingress/ -f k8s/scaling/ -f k8s/pdb/ -f k8s/security/
+   ```
+
+   The config files are applied by name so the template is never applied over the real Secret.
+
+5. Set `notes-app` as the default namespace for the rest of the commands:
+
+   ```bash
+   kubectl config set-context --current --namespace=notes-app
+   ```
+
+6. In a separate terminal, start the tunnel and leave it running:
+
+   ```bash
+   minikube tunnel
+   ```
+
+   On Windows this must run in an Administrator terminal, or it exits immediately.
+
+### Verify
 
 ```bash
-git clone https://github.com/Jason2303/Docker-NotesApp.git notes-app && cd notes-app
-cp .env.example .env          # then edit the placeholder values
-docker compose up -d --build
+kubectl get pods
 ```
 
-Open `http://localhost:8080`.
-
-## Development Mode
-
-`docker compose up` automatically loads `docker-compose.override.yml` on top of `docker-compose.yml`. Compose merges the two files: single values (like `command`) are replaced, lists (like `ports`) are appended, and maps (like `environment`) are merged by key. This turns the production-style base file into a development setup without editing it.
-
-| Feature | Detail |
-|---|---|
-| App ports | api `3000:3000`, worker `3001:3001` published for direct testing |
-| Debug ports | api `9229:9229`, worker `9230:9229` (Node inspector) |
-| Bind mounts | `./services/api:/app` and `./services/worker:/app`, plus an anonymous volume on `/app/node_modules` so the image's installed modules aren't hidden by the mount |
-| NODE_ENV | `development` |
-| Auto-restart | `node --watch` restarts on file changes. **Windows limitation:** file-change events don't cross from Windows into the container on bind mounts, so use `docker compose restart <service>` (or clone the repo inside WSL2) |
-
-## Production Mode
-
-Production uses pre-built images from Docker Hub; nothing is built locally.
+A healthy deployment shows 7 Pods, all `Running` and `1/1`: 2 api, 2 frontend, 1 worker, 1 redis and `postgres-0`. Image pulls on a fresh cluster can keep Pods in `ContainerCreating` for a few minutes, and api Pods show `Init:0/1` until Postgres is ready.
 
 ```bash
-docker compose -f docker-compose.prod.yml up -d
-docker compose -f docker-compose.prod.yml ps
+kubectl get hpa
+kubectl get pvc
+curl http://127.0.0.1/api/notes
 ```
 
-Passing `-f` tells Compose to load **only** that file, so neither the base file nor the dev override is applied. Images are pinned to version tags rather than `latest` because `latest` moves on every push; a version tag guarantees production runs exactly the image that was tested. Version tags are treated as immutable: a changed image gets a new tag (e.g. the frontend fix shipped as `v1.0.1`), never an overwrite.
+Then open `http://127.0.0.1/` in a browser to load the app.
 
-> The postgres service still bind-mounts `./database/init.sql`, so the repo (or at least that file) and a `.env` are required on the production host.
+![API reachable through the Ingress](images-k8s/apiurl.png)
+![Notes endpoint through the Ingress](images-k8s/apinotesurl.png)
 
-**First production run, pulling from Docker Hub (no build):**
+## Security
 
-![Pulling images from Docker Hub](images/pulls_from_docker_hub.png)
+**NetworkPolicies.**
 
-**All 5 services running and healthy:**
+| Policy                   | Protects       | Allows ingress from                                             |
+| ------------------------ | -------------- | --------------------------------------------------------------- |
+| `frontend-networkpolicy` | frontend :8080 | ingress-nginx namespace                                         |
+| `api-networkpolicy`      | api :3000      | frontend Pods, ingress-nginx namespace                          |
+| `postgres-networkpolicy` | postgres :5432 | api Pods                                                        |
+| `redis-networkpolicy`    | redis :6379    | api Pods, worker Pods                                           |
+| `dns-egress`             | all Pods       | Egress to CoreDNS (UDP and TCP 53) and to Pods in the namespace |
 
-![docker compose ps](images/docker_ps.png)
+Note: these policies are not enforced on this cluster. See Known Limitations.
 
-## Pulling from Docker Hub
+**Secrets.** Postgres credentials live in a Kubernetes Secret, not in the manifests or the images. The real `secret.yaml` is gitignored and only a template is committed. Secret values are base64-encoded, not encrypted, and minikube does not enable encryption at rest in etcd. In production they would come from an external secret store.
 
-Images are published under [hub.docker.com/u/atlas201](https://hub.docker.com/u/atlas201).
+**Non-root.** The api, worker and frontend containers set `runAsNonRoot: true` with a fixed non-root UID. Postgres and Redis run as their official images' defaults: their entrypoints start as root to set ownership on the data directory, then drop to the `postgres` and `redis` users.
+
+**Resource limits.** Every container has CPU and memory requests and limits, so one misbehaving Pod cannot starve the node.
+
+**Namespace isolation.** All resources live in `notes-app`, separate from system components and anything else on the cluster.
+
+## Design Decisions
+
+- **Probe timeouts raised above the 1 second default.** On the constrained node, healthy containers took longer than 1 second to answer under load, so probes failed and Kubernetes restarted healthy Pods (Postgres reached 9 restarts, Redis 11). The restarts raised CPU, the HPA added more Pods, and the node starved further. Timeouts were raised to 5s for the HTTP probes and Redis, and 10s for the Postgres `exec` probe. Restarts dropped to zero.
+- **The api Deployment has no `replicas` field.** The HPA owns the replica count. Setting both would make every `kubectl apply` reset the count and fight the autoscaler.
+- **The worker is not autoscaled.** Its CPU usage doesn't reflect how much work is queued.
+- **Redis has no persistence.** It holds a demo counter and pub/sub messages, non-critical data.
+- **Anti-affinity is `preferred`, not `required`.** On one node, `required` would leave every replica after the first stuck in `Pending`. `preferred` spreads replicas when more nodes exist and still schedules them on one node.
+- **Init container on the api.** The API already retries its database connection, but the init container makes the wait visible as `Init:0/1` in `kubectl get pods` instead of hiding it in application logs.
+- **StatefulSet with a headless Service for Postgres.** This gives the database a stable name (`postgres-0`) and a PVC that is reattached to the same Pod after it is recreated.
+- **Single Postgres replica.** Replication needs a second database Pod and more memory than the 3 GB node has. One replica with a PVC meets the persistence requirement.
+
+## Resilience Test Results
+
+The tests were run in PowerShell on Windows; the bash equivalent is shown below.
+
+### 1. Zero-downtime deploy
+
+A load loop sent a request to `/api/notes` through the Ingress every 200 ms while the api image was changed. Every response was logged as `OK` or `FAIL`. The tag `v1.1.0` is a local retag of `v1.0.0` loaded into minikube, used only to give the rollout a different image to roll to.
 
 ```bash
-docker pull atlas201/notes-api:v1.0.0
-docker pull atlas201/notes-worker:v1.0.0
-docker pull atlas201/notes-frontend:v1.0.1
+# one-time setup: create the second tag inside minikube
+docker tag atlas201/notes-api:v1.0.0 atlas201/notes-api:v1.1.0
+minikube image load atlas201/notes-api:v1.1.0
+
+# terminal 1: load loop
+rm -f load.log
+while true; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1/api/notes)
+  if [ "$code" = "200" ]; then line="OK $code"; else line="FAIL $code"; fi
+  echo "$line" | tee -a load.log
+  sleep 0.2
+done
+
+# terminal 2: roll out the new image and wait for it to finish
+kubectl set image deployment/api api=atlas201/notes-api:v1.1.0
+kubectl rollout status deployment/api
+
+# terminal 1, after the rollout finished and the loop was stopped
+grep -c "OK" load.log
+grep -c "FAIL" load.log
+grep -n "FAIL" load.log
 ```
 
-| Repository | Tags | Notes |
-|---|---|---|
-| atlas201/notes-api | `v1.0.0`, `latest` | |
-| atlas201/notes-worker | `v1.0.0`, `latest` | |
-| atlas201/notes-frontend | `v1.0.0`, `v1.0.1`, `latest` | `v1.0.1` adds an explicit `USER 101` (Trivy fix); `latest` = `v1.0.1` |
+**Expected:** no 5xx responses during the rollout.
 
-## Environment Variables
+**Result:** 152 requests were sent across the rollout. 151 returned `200` and none returned a 5xx. One request (number 115, near the end of the rollout) timed out at the client's 5-second limit without a response. Its timing matches the second new Pod starting up, which spikes CPU on a node already close to capacity. This is the same constrained-node behaviour described under probe timeouts in Design Decisions. On a node with spare capacity, or with more than one node, it would not be expected.
 
-All configuration is read from `.env` at runtime. `.env` is gitignored and dockerignored; `.env.example` (placeholders only) is committed.
+The rollout itself, with each new Pod becoming available before the next step:
 
-| Variable | Used by | Example | Secret? |
-|---|---|---|---|
-| FRONTEND_PORT | Compose (host port mapping) | `8080` | No |
-| API_PORT | api | `3000` | No |
-| WORKER_PORT | worker | `3001` | No |
-| POSTGRES_HOST | api | `postgres` | No |
-| POSTGRES_PORT | api | `5432` | No |
-| POSTGRES_DB | api, postgres | `notes` | No |
-| POSTGRES_USER | api, postgres | `notes` | No |
-| POSTGRES_PASSWORD | api, postgres | `changeme` | **Yes** |
-| REDIS_HOST | api, worker | `redis` | No |
-| REDIS_PORT | api, worker | `6379` | No |
-| NODE_ENV | api, worker | `production` (set in the image; `development` via override) | No |
+![Rollout completing](images-k8s/T3.png)
 
-**Least privilege:** each service receives only the variables it needs. The worker only talks to Redis, so it gets the Redis connection details and no Postgres credentials at all.
+The request counts and the single timeout:
 
-## Image Size Report
+![Request counts and the timeout](images-k8s/T2.png)
 
-| Image | Unpacked | Compressed (Docker Hub) |
-|---|---|---|
-| notes-api | ~89 MB | ~32 MB |
-| notes-worker | ~84 MB | ~31 MB |
-| notes-frontend | ~58 MB | ~23 MB |
+The Pod watch from an earlier run shows the mechanics: each new Pod reached `1/1` before any old Pod was terminated, and the ready count never dropped below 2.
 
-The first api image, based on `node:22-alpine`, was ~191 MB. Switching the runtime stage to `alpine:3.24` with only the `nodejs` package from `apk` (no npm, no build tools) cut it to ~89 MB.
+![Rolling update Pod watch](images-k8s/rollout.png)
 
-## Security Measures
+### 2. Self-healing
 
-- **Non-root users:** api and worker run as UID 1001 (`appuser`); the frontend runs as UID 101 (nginx-unprivileged), declared explicitly with `USER 101`
-- **Unprivileged ports:** all services listen on ports above 1024, so no root is needed to bind them
-- **Multi-stage builds:** npm and build tools stay in the builder stage; only the app code, production `node_modules` and the runtime reach the final image
-- **Pinned base images:** `alpine:3.24`, `postgres:16-alpine3.24`, `redis:8-alpine3.22`
-- **No secrets in images:** credentials are injected at runtime from `.env`, which is excluded by both `.gitignore` and `.dockerignore`
-- **Least-privilege env vars:** each service only receives the variables it needs (the worker has no DB password)
-- **Single entry point:** only port 8080 is published to the host; the api, worker and databases are not reachable from outside
-- **Internal networks:** the Postgres and Redis networks are `internal: true`
-- **Resource limits:** CPU and memory limits on every service in Compose
-
-## Vulnerability Scanning (Trivy)
-
-| Target | HIGH | CRITICAL | Notes |
-|---|---|---|---|
-| `trivy config .` | – | – | 1 finding (missing `USER` in the frontend Dockerfile) → fixed in v1.0.1 → 0 |
-| notes-api:v1.0.0 | 0 | 0 | |
-| notes-worker:v1.0.0 | 0 | 0 | |
-| notes-frontend:v1.0.1 | 1 | 0 | `libexpat` (CVE-2026-93990) from the nginx base image. Fixed upstream in 2.8.5-r0; remediate by rebuilding with `docker compose build --pull frontend` once the base image is updated |
-| postgres:16-alpine3.24 | 21 | 1 | Alpine packages clean. All findings are in the bundled `gosu` binary's Go standard library (TLS/HTTP/URL parsing code). `gosu` only switches user at startup and never uses the network, so these paths aren't reachable. Upstream-owned |
-| redis:8-alpine3.22 | 0 | 0 | |
-
-**All three project images have zero CRITICAL vulnerabilities.**
-
-Commands used:
+A bare Pod (not managed by any controller) and one api Pod were deleted at the same time. The bare Pod was a temporary test prop and was removed from the repo afterwards.
 
 ```bash
-trivy config .
-trivy image --severity HIGH,CRITICAL atlas201/notes-api:v1.0.0
-trivy image --scanners vuln --severity HIGH,CRITICAL postgres:16-alpine3.24
+kubectl get pods
+kubectl delete pod bare-pod <api-pod-name>
+kubectl get pods -w
 ```
 
-<details>
-<summary>Scan screenshots</summary>
+**Expected:** the api Pod is replaced, the bare Pod is not. **Result:** the api Pod was replaced within seconds by a new Pod with a new name suffix, because its ReplicaSet saw one fewer Pod than desired. The bare Pod was gone permanently, because nothing owned it.
 
-**Config scan (after fix)**
-![trivy config](images/trivy_findings_config_Dockerfile.png)
+![Self-healing](images-k8s/downtimetest1.png)
 
-**api**
-![trivy api](images/trivy_scan_api.png)
+### 3. Auto-scaling
 
-**worker**
-![trivy worker](images/trivy_scan_worker.png)
+A load generator sent requests to the api in a loop while the HPA was watched.
 
-**frontend**
-![trivy frontend](images/trivy_scan_frontend.png)
+```bash
+# terminal 1: watch the HPA
+kubectl get hpa api-hpa -w
 
-**postgres**
-![trivy postgres](images/trivy_scan_postgres.png)
+# terminal 2: generate load from inside the cluster
+kubectl run load-generator --image=busybox --restart=Never -- \
+  /bin/sh -c "while true; do wget -q -O- http://api:3000/api/notes > /dev/null; done"
 
-**redis**
-![trivy redis](images/trivy_scan_redis.png)
+# stop the load
+kubectl delete pod load-generator
+```
 
-</details>
+**Expected:** replicas rise above 2 under load and return to 2 afterwards. **Result:** CPU went from 2% to around 80%, and the HPA scaled from 2 to 4 replicas in the same reconcile cycle. After the load was stopped, CPU fell to 1-2% but the replicas stayed at 4 for about 4 more minutes before dropping back to 2. That delay is the HPA's default 5-minute scale-down stabilisation window, which stops replicas flapping when load briefly dips.
 
-## Healthchecks & Startup Order
+![HPA scaling](images-k8s/hpascaling.png)
 
-| Endpoint | Meaning |
-|---|---|
-| `/health` | Liveness: the process is running and can answer HTTP. Used by the Dockerfile `HEALTHCHECK` |
-| `/ready` | Readiness: the service's dependencies (Postgres/Redis) are connected and it can do real work |
+### 4. Data persistence
 
-Healthchecks call `http://127.0.0.1:<port>/health` rather than `localhost` (see Issues below). Postgres uses `pg_isready` and Redis uses `redis-cli ping`.
+A note was written to the database, the Postgres Pod was deleted, and the note was read back after the Pod returned.
 
-Startup order uses `depends_on` with `condition: service_healthy`: Postgres and Redis must be healthy before the api starts; Redis must be healthy before the worker starts; the api must be healthy before the frontend starts. Each service waits only for what it actually needs.
+```bash
+kubectl exec -it postgres-0 -- psql -U notes -d notes \
+  -c "INSERT INTO notes (title, content) VALUES ('persistence test', 'written before pod delete');"
 
-## Bonus Features
+kubectl delete pod postgres-0
+kubectl get pods -w     # wait for postgres-0 to be Running 1/1 again
 
-- **Nginx single entry point:** the frontend's Nginx serves the static files and reverse-proxies `/api` to `api:3000`. The browser only ever talks to port 8080, the frontend uses relative `/api` paths, and no CORS configuration is needed.
-- **Graceful shutdown:** both Node services handle `SIGTERM` by closing the HTTP server and the Redis/Postgres connections before exiting. Because `CMD` uses exec form (`["node", "server.js"]`), Node runs as PID 1 and receives the signal directly; the containers stop in ~2–3 s instead of being force-killed after the 10 s timeout.
+kubectl exec -it postgres-0 -- psql -U notes -d notes -c "SELECT * FROM notes;"
+```
 
-  ![Graceful shutdown](images/graceful_shutdown.png)
+**Expected:** the row survives. **Result:** the StatefulSet recreated the Pod with the same name, `postgres-0`, reattached the same PVC (`data-postgres-0`), and the row was still there. The data lives on the PersistentVolume, which is independent of the Pod's lifecycle.
 
-- **CI pipeline:** `.github/workflows/docker-publish.yml` (GitHub Actions) builds and pushes all three images on every push to `main` and on every `v*` git tag. A matrix runs the three services in parallel. Tags: git tag pushes publish that version (e.g. `v1.1.0`); pushes to `main` publish `latest` plus a `sha-<commit>` tag for traceability. BuildKit layer caching is stored in the GitHub Actions cache per service. Docker Hub credentials come from repository secrets (`DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`), never from the repo.
+![Data persistence](images-k8s/databasedelete.png)
 
-  ![CI run](images/ci_run.png)
+## Bonus
 
-## Issues Encountered & Fixes
+**Pod anti-affinity.** The api and frontend Deployments use `preferredDuringSchedulingIgnoredDuringExecution` anti-affinity on `kubernetes.io/hostname`, so the scheduler places replicas on different nodes when it can. On this single-node cluster it falls back to scheduling them together (see Design Decisions).
 
-| Problem | Cause | Fix |
-|---|---|---|
-| `npm ci` failed | No `package-lock.json`; `npm ci` requires one | Generated and committed lockfiles for all three services |
-| Image too large (~191 MB) | `node:22-alpine` ships npm, yarn and extra tooling; deleting files in a later layer doesn't shrink earlier layers | Runtime stage on `alpine:3.24` + `apk add nodejs` only (~89 MB) |
-| `chown -R` duplicated `node_modules` | `chown` after `COPY` rewrites every file into a new layer | Create the user first, then `COPY --chown` |
-| Healthchecks failing | BusyBox `wget` resolved `localhost` to IPv6 `::1`; the apps listen on IPv4 `0.0.0.0` | Healthchecks use `127.0.0.1` |
-| Image pulls failing (`no such host`) | Docker Desktop's internal DNS broke while Windows DNS worked | Quit Docker Desktop + `wsl --shutdown`, then restart |
-| Worker dev ports not reachable | Published ports are ignored on `internal: true` networks | Dev-only `dev-network` added in the override |
-| Hot reload not firing on Windows | File-change events don't propagate across Windows bind mounts | `docker compose restart <service>`, or clone inside WSL2 |
-| Worker counter reset on restart | Counter was stored in process memory | Counter moved into Redis (`INCR`); survives restarts and works across replicas |
-| Docker Hub `insufficient_scope` | Images tagged with the wrong username | Re-tagged as `atlas201/...` |
-| Push failing (`broken pipe`) | Unstable connection dropped the largest layer mid-upload | Re-ran the push (finished layers are skipped); set `max-concurrent-uploads: 1` in the Docker daemon config |
-| Trivy: missing USER in frontend | Base image already runs as UID 101, but Trivy only reads the Dockerfile text | Added explicit `USER 101`; released as a new tag `v1.0.1` instead of overwriting `v1.0.0` |
+**Init container.** The api Pods run an init container that loops on `pg_isready` until Postgres accepts connections. Until it succeeds, the Pod shows `Init:0/1`, and its logs show `postgres:5432 - accepting connections` followed by `postgres is ready` before the main container starts.
 
-## Known Limitations
+## Known Limitations / Not Attempted
 
-- No frontend hot reload in dev mode (would need a separate Vite dev-server stage)
-- The `nginx-unprivileged:stable-alpine3.24` tag floats; it isn't pinned to a specific Nginx version or digest
-- Production still depends on the `init.sql` bind mount (to be baked into a custom Postgres image in the capstone)
-- One HIGH (`libexpat`) in the frontend base image, pending an upstream rebuild
-- Redis image is on Alpine 3.22 (currently scans clean)
+- **NetworkPolicies are not enforced on this cluster.** minikube is running its default bridge CNI, which ignores NetworkPolicy objects. Calico, which does enforce them, did not fit in the 3 GB node. The policies apply cleanly and are written to be enforced on a CNI that supports them, such as Calico or a managed cloud CNI on EKS or AKS, but on this cluster they have no effect.
+- **Storage is node-local.** The PVC is provisioned by minikube's default storage provisioner, which writes to a directory on the minikube node. Data survives Pod deletion and `minikube stop`, but `minikube delete` destroys it, and it is not replicated. Production would use a cloud block-storage StorageClass e.g AWS EBS.
+- **Single node.** Every Pod runs on one node, so a node failure takes down the whole application, and anti-affinity cannot spread replicas.
+- **Single Postgres replica.** No database replication or failover.
+- **Helm chart not implemented.** The application is deployed from plain manifests.
+- **TLS on the Ingress not implemented.** Traffic between the browser and the Ingress is plain HTTP.
+
+## Cleanup
+
+Remove the application. Deleting the namespace deletes everything inside it, including the PVC and its data:
+
+```bash
+kubectl delete namespace notes-app
+```
+
+Stop the cluster but keep it for later:
+
+```bash
+minikube stop
+```
+
+Delete the cluster completely:
+
+```bash
+minikube delete
+```
+
+Stop `minikube tunnel` with `Ctrl+C` in its terminal.

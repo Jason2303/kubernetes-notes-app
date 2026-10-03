@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  selector:
+    matchLabels:
+      app: api 
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: api
+                topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: wait-for-db
+          image: postgres:16-alpine3.24
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h $POSTGRES_HOST -p $POSTGRES_PORT -U $POSTGRES_USER; do
+                echo "waiting for postgres"
+                sleep 2
+              done
+              echo "postgres is ready"
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secret
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "20m"
+            limits:
+              memory: "64Mi"
+              cpu: "100m"
+      containers:
+        - name: api
+          image: atlas201/notes-api:v1.0.0
+          ports:
+            - containerPort: 3000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secret
+          env:
+            - name: PORT
+              value: "3000"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3

@@ -1,6 +1,7 @@
 services:
   frontend:
-    image: atlas201/notes-frontend:v1.0.1
+    build: 
+      context: ../services/frontend 
     ports: 
       - "${FRONTEND_PORT}:8080"
     networks:
@@ -15,7 +16,8 @@ services:
           memory: 256M
 
   api:
-    image: atlas201/notes-api:v1.0.0
+    build: 
+      context: ../services/api
     environment:
       PORT: ${API_PORT}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -41,7 +43,8 @@ services:
           memory: 256M 
        
   worker:
-    image: atlas201/notes-worker:v1.0.0
+    build: 
+      context: ../services/worker
     environment:
       PORT: ${WORKER_PORT}
       REDIS_HOST: ${REDIS_HOST}

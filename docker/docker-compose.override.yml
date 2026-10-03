@@ -6,7 +6,7 @@ services:
       - "3000:3000"                
       - "9229:9229"                
     volumes:
-      - ./services/api:/app                  
+      - ../services/api:/app                  
       - /app/node_modules         
     command: ["node", "--watch", "--inspect=0.0.0.0:9229", "server.js"]
 
@@ -20,7 +20,7 @@ services:
       - redis-network
       - dev-network
     volumes:
-      - ./services/worker:/app     
+      - ../services/worker:/app     
       - /app/node_modules          
     command: ["node", "--watch", "--inspect=0.0.0.0:9229", "server.js"]
 

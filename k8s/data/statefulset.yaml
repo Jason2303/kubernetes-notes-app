@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres #Used to set the pod names i.e postgres-0, postgres-1 etc
+spec:
+  serviceName: postgres-headless #Headless Service Name
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine3.24
+          ports:
+            - containerPort: 5432
+              name: postgres
+          envFrom:
+            - secretRef:
+                name: app-secret
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init-sql #Must match the volume name
+              mountPath: /docker-entrypoint-initdb.d/init.sql
+              subPath: init.sql
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "notes"]
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "notes"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+      volumes:
+        - name: init-sql #Matching the mount name
+          configMap:
+            name: init-sql
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
