@@ -297,10 +297,6 @@ The request counts and the single timeout:
 
 ![Request counts and the timeout](images-k8s/T2.png)
 
-The Pod watch from an earlier run shows the mechanics: each new Pod reached `1/1` before any old Pod was terminated, and the ready count never dropped below 2.
-
-![Rolling update Pod watch](images-k8s/rollout.png)
-
 ### 2. Self-healing
 
 A bare Pod (not managed by any controller) and one api Pod were deleted at the same time. The bare Pod was a temporary test prop and was removed from the repo afterwards.
